@@ -101,6 +101,99 @@ class FinanceDatabaseTests(TestCase):
         self.assertEqual(Decimal(totals["USD"]), Decimal("1.10"))
         self.assertEqual(Decimal(totals["UZS"]), Decimal("0.00"))
 
+    def test_transaction_listing_is_scoped_and_paginates(self) -> None:
+        first_id = database.add_transaction(
+            1001, "expense", "10", "UZS", "food", "first", self.occurred_at
+        )
+        second_id = database.add_transaction(
+            1001, "income", "20", "USD", "salary", "second", self.occurred_at
+        )
+        self.add(1002, "expense", "999", "UZS")
+
+        all_rows = database.list_transactions(1001, limit=50, offset=0)
+        page = database.list_transactions(1001, limit=1, offset=1)
+
+        self.assertEqual({row["id"] for row in all_rows}, {first_id, second_id})
+        self.assertEqual(len(page), 1)
+        self.assertEqual(page[0]["telegram_user_id"], 1001)
+        self.assertNotIn(1002, {row["telegram_user_id"] for row in all_rows})
+
+    def test_transaction_read_update_and_delete_require_owner(self) -> None:
+        transaction_id = database.add_transaction(
+            1001, "expense", "10.00", "UZS", "food", "before", self.occurred_at
+        )
+
+        self.assertIsNone(database.get_transaction(1002, transaction_id))
+        self.assertFalse(database.update_transaction(
+            1002, transaction_id, kind="income", amount="50", currency="USD",
+            category="salary", description="unauthorized", occurred_at=self.occurred_at,
+        ))
+        self.assertFalse(database.delete_transaction(1002, transaction_id))
+        still_owned = database.get_transaction(1001, transaction_id)
+        self.assertEqual(still_owned["amount"], "10.00")
+        self.assertEqual(still_owned["description"], "before")
+
+    def test_transaction_update_normalizes_amount_and_persists_all_fields(self) -> None:
+        transaction_id = database.add_transaction(
+            1001, "expense", "10", "UZS", "food", "before", self.occurred_at
+        )
+        new_date = datetime(2026, 11, 22, 8, 30, tzinfo=timezone.utc)
+
+        updated = database.update_transaction(
+            1001, transaction_id, kind="income", amount="20.50", currency="USD",
+            category="salary", description="corrected", occurred_at=new_date,
+        )
+
+        saved = database.get_transaction(1001, transaction_id)
+        self.assertTrue(updated)
+        self.assertEqual(saved["kind"], "income")
+        self.assertEqual(saved["amount"], "20.50")
+        self.assertEqual(saved["currency"], "USD")
+        self.assertEqual(saved["category"], "salary")
+        self.assertEqual(saved["description"], "corrected")
+        self.assertIn("2026-11-22", saved["occurred_at"])
+
+    def test_transaction_delete_removes_only_target_record(self) -> None:
+        transaction_id = database.add_transaction(
+            1001, "expense", "10", "UZS", "food", "remove", self.occurred_at
+        )
+        remaining_id = database.add_transaction(
+            1001, "expense", "20", "UZS", "transport", "keep", self.occurred_at
+        )
+
+        self.assertTrue(database.delete_transaction(1001, transaction_id))
+        self.assertFalse(database.delete_transaction(1001, transaction_id))
+        rows = database.list_transactions(1001, limit=50)
+        self.assertEqual([row["id"] for row in rows], [remaining_id])
+
+    def test_transaction_update_rejects_invalid_financial_fields_without_changes(self) -> None:
+        transaction_id = database.add_transaction(
+            1001, "expense", "10", "UZS", "food", "unchanged", self.occurred_at
+        )
+        invalid_updates = [
+            {"kind": "transfer", "amount": "20", "currency": "UZS"},
+            {"kind": "income", "amount": "-1", "currency": "UZS"},
+            {"kind": "income", "amount": "NaN", "currency": "UZS"},
+            {"kind": "income", "amount": "20", "currency": "EUR"},
+        ]
+        for fields in invalid_updates:
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                database.update_transaction(
+                    1001, transaction_id, category="salary", description="changed",
+                    occurred_at=self.occurred_at, **fields,
+                )
+
+        saved = database.get_transaction(1001, transaction_id)
+        self.assertEqual(saved["kind"], "expense")
+        self.assertEqual(saved["amount"], "10")
+        self.assertEqual(saved["currency"], "UZS")
+        self.assertEqual(saved["description"], "unchanged")
+
+    def test_transaction_list_rejects_unsafe_pagination_bounds(self) -> None:
+        for kwargs in ({"limit": 0}, {"limit": 51}, {"offset": -1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                database.list_transactions(1001, **kwargs)
+
 
 if __name__ == "__main__":
     import unittest
