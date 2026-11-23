@@ -3,6 +3,7 @@
 import os
 import sqlite3
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -86,14 +87,75 @@ def set_language(telegram_user_id: int, language: str) -> None:
 
 
 def set_usd_to_uzs_rate(telegram_user_id: int, rate: str) -> None:
-    """Store a user-provided USD to UZS rate as text to avoid float rounding."""
+    """Store a positive user-provided rate as text to avoid float rounding."""
+    parsed_rate = _parse_positive_decimal(rate, "exchange rate")
+    normalized_rate = format(parsed_rate, "f")
     with _connect() as connection:
         connection.execute(
             "INSERT INTO users (telegram_user_id, usd_to_uzs_rate) VALUES (?, ?) "
             "ON CONFLICT (telegram_user_id) DO UPDATE "
             "SET usd_to_uzs_rate = excluded.usd_to_uzs_rate",
-            (telegram_user_id, rate),
+            (telegram_user_id, normalized_rate),
         )
+
+
+def get_usd_to_uzs_rate(telegram_user_id: int) -> str | None:
+    """Return this user's stored USD-to-UZS rate, if one has been set."""
+    rate = ensure_user(telegram_user_id)["usd_to_uzs_rate"]
+    if rate is None:
+        return None
+    parsed_rate = _parse_positive_decimal(rate, "stored exchange rate")
+    return format(parsed_rate, "f")
+
+
+def get_balance_totals(telegram_user_id: int) -> dict[str, str]:
+    """Return net balances per currency without using SQLite floating sums."""
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT kind, currency, amount FROM transactions "
+            "WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ).fetchall()
+
+    balances = {"UZS": Decimal("0"), "USD": Decimal("0")}
+    amounts: list[tuple[str, str, Decimal]] = []
+    max_adjusted = 0
+    min_exponent = 0
+    for row in rows:
+        kind = row["kind"]
+        currency = row["currency"]
+        if kind not in {"income", "expense"} or currency not in balances:
+            raise ValueError("Stored transaction has an invalid kind or currency")
+        amount = _parse_positive_decimal(row["amount"], "stored transaction amount")
+        max_adjusted = max(max_adjusted, amount.adjusted())
+        min_exponent = min(min_exponent, amount.as_tuple().exponent)
+        amounts.append((kind, currency, amount))
+
+    # Decimal arithmetic obeys the active context. Widen it based on the
+    # largest stored amount and row count so totals remain exact as records grow.
+    precision = max(28, max_adjusted - min_exponent + 1 + len(str(len(amounts))) + 2)
+    with localcontext() as context:
+        context.prec = precision
+        for kind, currency, amount in amounts:
+            balances[currency] += amount if kind == "income" else -amount
+
+    return {currency: format(balance, "f") for currency, balance in balances.items()}
+
+
+def _parse_positive_decimal(value: str, label: str) -> Decimal:
+    """Parse bounded plain decimal text and reject unsafe/malformed values."""
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError(f"Invalid {label}")
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {label}") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"Invalid {label}")
+    parts = parsed.as_tuple()
+    if parsed.adjusted() > 18 or parts.exponent < -18 or parts.exponent > 18:
+        raise ValueError(f"Invalid {label}")
+    return parsed
 
 
 def add_transaction(
@@ -110,6 +172,8 @@ def add_transaction(
         raise ValueError("Unsupported transaction kind")
     if currency not in {"UZS", "USD"}:
         raise ValueError("Unsupported currency")
+    parsed_amount = _parse_positive_decimal(amount, "transaction amount")
+    normalized_amount = format(parsed_amount, "f")
     ensure_user(telegram_user_id)
     with _connect() as connection:
         cursor = connection.execute(
@@ -119,7 +183,7 @@ def add_transaction(
             (
                 telegram_user_id,
                 kind,
-                amount,
+                normalized_amount,
                 currency,
                 category,
                 description,
