@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from datetime import date as date_type
 from decimal import Decimal, InvalidOperation, localcontext
 from zoneinfo import ZoneInfo
 
@@ -21,9 +22,13 @@ from database import (
     get_balance_totals,
     get_language,
     get_usd_to_uzs_rate,
+    delete_transaction,
+    get_transaction,
     initialize_database,
+    list_transactions,
     set_language,
     set_usd_to_uzs_rate,
+    update_transaction,
 )
 
 
@@ -47,6 +52,19 @@ class TransactionFlow(StatesGroup):
     rate = State()
 
 
+class SavedOperationFlow(StatesGroup):
+    viewing = State()
+    edit_fields = State()
+    edit_kind = State()
+    edit_currency = State()
+    edit_amount = State()
+    edit_description = State()
+    edit_date = State()
+    edit_category = State()
+    edit_confirmation = State()
+    delete_confirmation = State()
+
+
 CATEGORIES = {
     "expense": ["groceries", "transport", "housing", "health", "entertainment", "other"],
     "income": ["salary", "business", "gift", "other"],
@@ -58,6 +76,7 @@ TEXT = {
         "welcome": "Здравствуйте! Это AI Финансовый помощник.",
         "menu": "Главное меню. Выберите действие:",
         "operation": "Добавить операцию",
+        "transactions": "Мои операции",
         "balance": "Баланс",
         "report": "Отчёт",
         "rate": "Курс USD/UZS",
@@ -87,6 +106,34 @@ TEXT = {
         "rate_invalid": "Введите положительный курс числом, например 12900 или 12900,50.",
         "rate_saved": "Курс сохранён: 1 USD = {rate} UZS.",
         "rate_cancelled": "Изменение курса отменено.",
+        "transactions_empty": "Пока нет сохранённых операций.",
+        "transactions_title": "Ваши операции (страница {page}):",
+        "transaction_details": "Операция №{id}\n{kind}: {amount} {currency}\nКатегория: {category}\nОписание: {description}\nДата: {date}",
+        "edit_transaction": "Изменить",
+        "delete_transaction": "Удалить",
+        "back": "К списку",
+        "edit_choose_field": "Что изменить?",
+        "edit_kind": "Тип операции",
+        "edit_amount": "Сумма",
+        "edit_currency": "Валюта",
+        "edit_category": "Категория",
+        "edit_description": "Описание",
+        "edit_date": "Дата",
+        "enter_new_amount": "Введите новую положительную сумму.",
+        "enter_new_description": "Введите новое описание (до 1000 символов). Для пустого описания отправьте —",
+        "enter_new_date": "Введите новую дату в формате ГГГГ-ММ-ДД.",
+        "invalid_new_amount": "Некорректная сумма. Введите положительное число (до 18 цифр и 6 знаков после запятой).",
+        "invalid_new_description": "Описание должно быть не длиннее 1000 символов.",
+        "invalid_new_date": "Дата должна быть в формате ГГГГ-ММ-ДД.",
+        "edit_review": "Подтвердите изменение операции №{id}:\n{kind}: {amount} {currency}\nКатегория: {category}\nОписание: {description}\nДата: {date}",
+        "edit_confirm": "Подтвердить изменение",
+        "edit_saved": "Операция обновлена.",
+        "edit_cancelled": "Изменение отменено.",
+        "delete_review": "Вы уверены, что хотите удалить эту операцию?\n{details}",
+        "delete_confirm": "Да, удалить",
+        "delete_saved": "Операция удалена.",
+        "transaction_not_found": "Операция не найдена. Возможно, список устарел.",
+        "stale_edit": "Операция изменилась после открытия. Изменения не применены; откройте её снова.",
         "categories": {
             "groceries": "Продукты", "transport": "Транспорт", "housing": "Жильё",
             "health": "Здоровье", "entertainment": "Развлечения", "salary": "Зарплата",
@@ -98,6 +145,7 @@ TEXT = {
         "welcome": "Assalomu alaykum! Bu AI Moliyaviy yordamchi.",
         "menu": "Asosiy menyu. Amalni tanlang:",
         "operation": "Operatsiya qo‘shish",
+        "transactions": "Operatsiyalarim",
         "balance": "Balans",
         "report": "Hisobot",
         "rate": "USD/UZS kursi",
@@ -127,6 +175,34 @@ TEXT = {
         "rate_invalid": "Musbat kursni kiriting, masalan 12900 yoki 12900,50.",
         "rate_saved": "Kurs saqlandi: 1 USD = {rate} UZS.",
         "rate_cancelled": "Kursni o‘zgartirish bekor qilindi.",
+        "transactions_empty": "Hozircha saqlangan operatsiyalar yo‘q.",
+        "transactions_title": "Operatsiyalaringiz ({page}-sahifa):",
+        "transaction_details": "Operatsiya №{id}\n{kind}: {amount} {currency}\nToifa: {category}\nIzoh: {description}\nSana: {date}",
+        "edit_transaction": "Tahrirlash",
+        "delete_transaction": "O‘chirish",
+        "back": "Ro‘yxatga",
+        "edit_choose_field": "Nimani o‘zgartiramiz?",
+        "edit_kind": "Operatsiya turi",
+        "edit_amount": "Summa",
+        "edit_currency": "Valyuta",
+        "edit_category": "Toifa",
+        "edit_description": "Izoh",
+        "edit_date": "Sana",
+        "enter_new_amount": "Yangi musbat summani kiriting.",
+        "enter_new_description": "Yangi izohni kiriting (1000 belgigacha). Bo‘sh izoh uchun — yuboring",
+        "enter_new_date": "Yangi sanani YYYY-MM-DD formatida kiriting.",
+        "invalid_new_amount": "Summa noto‘g‘ri. Musbat son kiriting (18 raqam va kasrdan keyin 6 belgigacha).",
+        "invalid_new_description": "Izoh 1000 belgidan oshmasligi kerak.",
+        "invalid_new_date": "Sana YYYY-MM-DD formatida bo‘lishi kerak.",
+        "edit_review": "№{id} operatsiya o‘zgarishini tasdiqlang:\n{kind}: {amount} {currency}\nToifa: {category}\nIzoh: {description}\nSana: {date}",
+        "edit_confirm": "O‘zgarishni tasdiqlash",
+        "edit_saved": "Operatsiya yangilandi.",
+        "edit_cancelled": "Tahrirlash bekor qilindi.",
+        "delete_review": "Ushbu operatsiyani o‘chirishni xohlaysizmi?\n{details}",
+        "delete_confirm": "Ha, o‘chirish",
+        "delete_saved": "Operatsiya o‘chirildi.",
+        "transaction_not_found": "Operatsiya topilmadi. Ro‘yxat eskirgan bo‘lishi mumkin.",
+        "stale_edit": "Operatsiya ochilgandan keyin o‘zgargan. O‘zgarishlar qo‘llanmadi; uni qayta oching.",
         "categories": {
             "groceries": "Oziq-ovqat", "transport": "Transport", "housing": "Uy-joy",
             "health": "Sog‘liq", "entertainment": "Ko‘ngilochar", "salary": "Maosh",
@@ -148,6 +224,7 @@ def main_menu(language: str) -> InlineKeyboardMarkup:
     buttons = [
         ("operation", "menu:operation"),
         ("balance", "menu:balance"),
+        ("transactions", "menu:transactions"),
         ("report", "menu:report"),
         ("rate", "menu:rate"),
         ("language", "menu:language"),
@@ -193,6 +270,77 @@ def rate_keyboard(language: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=TEXT[language]["cancel"], callback_data="rate:cancel")
     ]])
+
+
+def transaction_list_keyboard(rows: list[dict], offset: int, language: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in rows:
+        kind = TEXT[language][item["kind"]]
+        label = f"{item['occurred_at'][:10]} · {kind} · {format_decimal(Decimal(item['amount']), language)} {item['currency']}"
+        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"saved:open:{item['id']}")])
+    navigation = []
+    if offset > 0:
+        navigation.append(InlineKeyboardButton(text="‹", callback_data=f"saved:list:{max(0, offset - 10)}"))
+    if len(rows) == 10:
+        navigation.append(InlineKeyboardButton(text="›", callback_data=f"saved:list:{offset + 10}"))
+    if navigation:
+        buttons.append(navigation)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def transaction_detail_keyboard(transaction_id: int, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=TEXT[language]["edit_transaction"], callback_data=f"saved:edit:{transaction_id}")],
+        [InlineKeyboardButton(text=TEXT[language]["delete_transaction"], callback_data=f"saved:delete:{transaction_id}")],
+        [InlineKeyboardButton(text=TEXT[language]["back"], callback_data="saved:list:0")],
+    ])
+
+
+def edit_fields_keyboard(transaction_id: int, language: str) -> InlineKeyboardMarkup:
+    labels = TEXT[language]
+    fields = ["kind", "amount", "currency", "category", "description", "date"]
+    rows = [[InlineKeyboardButton(text=labels[f"edit_{field}"], callback_data=f"saved:field:{field}:{transaction_id}")]
+            for field in fields]
+    rows.append([InlineKeyboardButton(text=labels["back"], callback_data=f"saved:open:{transaction_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def edit_confirmation_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=TEXT[language]["edit_confirm"], callback_data="saved:edit-confirm"),
+        InlineKeyboardButton(text=TEXT[language]["cancel"], callback_data="saved:edit-cancel"),
+    ]])
+
+
+def delete_confirmation_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=TEXT[language]["delete_confirm"], callback_data="saved:delete-confirm"),
+        InlineKeyboardButton(text=TEXT[language]["cancel"], callback_data="saved:delete-cancel"),
+    ]])
+
+
+def saved_transaction_text(transaction: dict, language: str, template_key: str = "transaction_details") -> str:
+    occurred_at = datetime.fromisoformat(transaction["occurred_at"])
+    return TEXT[language][template_key].format(
+        id=transaction["id"],
+        kind=TEXT[language][transaction["kind"]],
+        amount=format_decimal(Decimal(transaction["amount"]), language),
+        currency=transaction["currency"],
+        category=TEXT[language]["categories"].get(transaction["category"], transaction["category"]),
+        description=transaction["description"] or "—",
+        date=occurred_at.strftime("%Y-%m-%d"),
+    )
+
+
+async def show_saved_transactions(message: Message, telegram_user_id: int, language: str, offset: int = 0) -> None:
+    rows = list_transactions(telegram_user_id, limit=10, offset=offset)
+    if not rows:
+        await message.answer(TEXT[language]["transactions_empty"])
+        return
+    await message.answer(
+        TEXT[language]["transactions_title"].format(page=offset // 10 + 1),
+        reply_markup=transaction_list_keyboard(rows, offset, language),
+    )
 
 
 def parse_positive_decimal(raw: str) -> Decimal | None:
@@ -296,6 +444,9 @@ async def menu_action(query: CallbackQuery, state: FSMContext) -> None:
                 balance_message += "\n" + TEXT[language]["balance_rate_missing"]
             await query.message.answer(balance_message)
             return
+        if query.data == "menu:transactions":
+            await show_saved_transactions(query.message, query.from_user.id, language)
+            return
         if query.data == "menu:rate":
             current_rate = get_usd_to_uzs_rate(query.from_user.id)
             await state.set_state(TransactionFlow.rate)
@@ -309,6 +460,378 @@ async def menu_action(query: CallbackQuery, state: FSMContext) -> None:
             await query.message.answer(prompt, reply_markup=rate_keyboard(language))
             return
         await query.message.answer(TEXT[language]["soon"])
+
+
+@dp.callback_query(lambda query: query.data and query.data.startswith("saved:list:"))
+async def saved_transactions_page(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        offset = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    if offset < 0 or offset > 100000 or offset % 10:
+        await query.answer()
+        return
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if query.message:
+        await show_saved_transactions(query.message, query.from_user.id, language, offset)
+
+
+@dp.callback_query(lambda query: query.data and query.data.startswith("saved:open:"))
+async def open_saved_transaction(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    transaction = get_transaction(query.from_user.id, transaction_id)
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if not query.message:
+        return
+    if transaction is None:
+        await query.message.answer(TEXT[language]["transaction_not_found"])
+        return
+    await state.update_data(transaction_id=transaction_id)
+    await state.set_state(SavedOperationFlow.viewing)
+    await query.message.answer(
+        saved_transaction_text(transaction, language),
+        reply_markup=transaction_detail_keyboard(transaction_id, language),
+    )
+
+
+@dp.callback_query(SavedOperationFlow.viewing, lambda query: query.data and query.data.startswith("saved:edit:"))
+async def begin_saved_transaction_edit(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    view_data = await state.get_data()
+    if view_data.get("transaction_id") != transaction_id:
+        await query.answer()
+        return
+    transaction = get_transaction(query.from_user.id, transaction_id)
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if transaction is None or not query.message:
+        if query.message:
+            await query.message.answer(TEXT[language]["transaction_not_found"])
+        return
+    await state.update_data(
+        transaction_id=transaction_id,
+        original=transaction,
+        proposed=dict(transaction),
+    )
+    await state.set_state(SavedOperationFlow.edit_fields)
+    await query.message.answer(
+        TEXT[language]["edit_choose_field"],
+        reply_markup=edit_fields_keyboard(transaction_id, language),
+    )
+
+
+@dp.callback_query(lambda query: query.data and query.data.startswith("saved:field:"))
+async def choose_saved_transaction_field(query: CallbackQuery, state: FSMContext) -> None:
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        await query.answer()
+        return
+    field, raw_id = parts[2], parts[3]
+    try:
+        transaction_id = int(raw_id)
+    except ValueError:
+        await query.answer()
+        return
+    data = await state.get_data()
+    if (await state.get_state()) != SavedOperationFlow.edit_fields.state or data.get("transaction_id") != transaction_id or not data.get("original"):
+        await query.answer()
+        return
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if not query.message:
+        return
+    if field == "kind":
+        await state.set_state(SavedOperationFlow.edit_kind)
+        await query.message.answer(
+            TEXT[language]["edit_kind"],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=TEXT[language]["income"], callback_data=f"saved:kind:income:{transaction_id}"),
+                InlineKeyboardButton(text=TEXT[language]["expense"], callback_data=f"saved:kind:expense:{transaction_id}"),
+            ]]),
+        )
+    elif field == "currency":
+        await state.set_state(SavedOperationFlow.edit_currency)
+        await query.message.answer(
+            TEXT[language]["choose_currency"],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="UZS — so‘m", callback_data=f"saved:currency:UZS:{transaction_id}"),
+                InlineKeyboardButton(text="USD — $", callback_data=f"saved:currency:USD:{transaction_id}"),
+            ]]),
+        )
+    elif field == "category":
+        proposed = data["proposed"]
+        await state.set_state(SavedOperationFlow.edit_category)
+        await query.message.answer(
+            TEXT[language]["choose_category"],
+            reply_markup=saved_category_keyboard(language, proposed["kind"], transaction_id),
+        )
+    elif field in {"amount", "description", "date"}:
+        state_map = {
+            "amount": (SavedOperationFlow.edit_amount, "enter_new_amount"),
+            "description": (SavedOperationFlow.edit_description, "enter_new_description"),
+            "date": (SavedOperationFlow.edit_date, "enter_new_date"),
+        }
+        flow_state, prompt = state_map[field]
+        await state.set_state(flow_state)
+        await query.message.answer(TEXT[language][prompt])
+    else:
+        return
+
+
+def saved_category_keyboard(language: str, kind: str, transaction_id: int) -> InlineKeyboardMarkup:
+    labels = TEXT[language]["categories"]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=labels[key], callback_data=f"saved:category:{key}:{transaction_id}")]
+        for key in CATEGORIES[kind]
+    ])
+
+
+async def show_edit_review(message: Message, state: FSMContext, language: str) -> None:
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await state.clear()
+        return
+    await state.set_state(SavedOperationFlow.edit_confirmation)
+    await message.answer(
+        saved_transaction_text(proposed, language, "edit_review"),
+        reply_markup=edit_confirmation_keyboard(language),
+    )
+
+
+@dp.callback_query(SavedOperationFlow.edit_kind, lambda query: query.data and query.data.startswith("saved:kind:"))
+async def choose_edited_transaction_kind(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("proposed"):
+        await query.answer()
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or parts[3] != str(data.get("transaction_id")):
+        await query.answer()
+        return
+    kind = parts[2]
+    if kind not in {"income", "expense"}:
+        await query.answer()
+        return
+    proposed = data["proposed"]
+    proposed["kind"] = kind
+    await state.update_data(proposed=proposed)
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if proposed["category"] not in CATEGORIES[kind]:
+        await state.set_state(SavedOperationFlow.edit_category)
+        if query.message:
+            await query.message.answer(
+                TEXT[language]["choose_category"],
+                reply_markup=saved_category_keyboard(language, kind, data["transaction_id"]),
+            )
+        return
+    if query.message:
+        await show_edit_review(query.message, state, language)
+
+
+@dp.callback_query(SavedOperationFlow.edit_category, lambda query: query.data and query.data.startswith("saved:category:"))
+async def choose_edited_transaction_category(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await query.answer()
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or parts[3] != str(data.get("transaction_id")):
+        await query.answer()
+        return
+    category = parts[2]
+    if category not in CATEGORIES.get(proposed["kind"], []):
+        await query.answer()
+        return
+    proposed["category"] = category
+    await state.update_data(proposed=proposed)
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if query.message:
+        await show_edit_review(query.message, state, language)
+
+
+@dp.callback_query(SavedOperationFlow.edit_currency, lambda query: query.data and query.data.startswith("saved:currency:"))
+async def choose_edited_transaction_currency(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await query.answer()
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or parts[3] != str(data.get("transaction_id")) or parts[2] not in {"UZS", "USD"}:
+        await query.answer()
+        return
+    proposed["currency"] = parts[2]
+    await state.update_data(proposed=proposed)
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if query.message:
+        await show_edit_review(query.message, state, language)
+
+
+@dp.message(SavedOperationFlow.edit_amount)
+async def enter_edited_transaction_amount(message: Message, state: FSMContext) -> None:
+    language = get_language(message.from_user.id) if message.from_user else None
+    language = language or "ru"
+    amount = parse_positive_decimal(message.text or "")
+    if amount is None:
+        await message.answer(TEXT[language]["invalid_new_amount"])
+        return
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await state.clear()
+        return
+    proposed["amount"] = format(amount, "f")
+    await state.update_data(proposed=proposed)
+    await show_edit_review(message, state, language)
+
+
+@dp.message(SavedOperationFlow.edit_description)
+async def enter_edited_transaction_description(message: Message, state: FSMContext) -> None:
+    language = get_language(message.from_user.id) if message.from_user else None
+    language = language or "ru"
+    description = message.text or ""
+    if len(description) > 1000:
+        await message.answer(TEXT[language]["invalid_new_description"])
+        return
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await state.clear()
+        return
+    proposed["description"] = "" if description.strip() == "—" else description.strip()
+    await state.update_data(proposed=proposed)
+    await show_edit_review(message, state, language)
+
+
+@dp.message(SavedOperationFlow.edit_date)
+async def enter_edited_transaction_date(message: Message, state: FSMContext) -> None:
+    language = get_language(message.from_user.id) if message.from_user else None
+    language = language or "ru"
+    try:
+        entered_date = date_type.fromisoformat((message.text or "").strip())
+    except ValueError:
+        await message.answer(TEXT[language]["invalid_new_date"])
+        return
+    data = await state.get_data()
+    proposed = data.get("proposed")
+    if not proposed:
+        await state.clear()
+        return
+    proposed["occurred_at"] = datetime.combine(entered_date, datetime.min.time(), ZoneInfo("Asia/Tashkent")).isoformat(timespec="seconds")
+    await state.update_data(proposed=proposed)
+    await show_edit_review(message, state, language)
+
+
+@dp.callback_query(SavedOperationFlow.edit_confirmation, lambda query: query.data == "saved:edit-confirm")
+async def confirm_saved_transaction_edit(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    original, proposed = data.get("original"), data.get("proposed")
+    transaction_id = data.get("transaction_id")
+    language = get_language(query.from_user.id) or "ru"
+    current = get_transaction(query.from_user.id, transaction_id) if transaction_id else None
+    await query.answer()
+    if not query.message:
+        return
+    if not original or not proposed or current != original:
+        await state.clear()
+        await query.message.answer(TEXT[language]["stale_edit"])
+        return
+    succeeded = update_transaction(
+        query.from_user.id,
+        transaction_id,
+        kind=proposed["kind"],
+        amount=proposed["amount"],
+        currency=proposed["currency"],
+        category=proposed["category"],
+        description=proposed["description"],
+        occurred_at=datetime.fromisoformat(proposed["occurred_at"]),
+    )
+    await state.clear()
+    await query.message.answer(TEXT[language]["edit_saved"] if succeeded else TEXT[language]["transaction_not_found"])
+
+
+@dp.callback_query(SavedOperationFlow.edit_confirmation, lambda query: query.data == "saved:edit-cancel")
+async def cancel_saved_transaction_edit(query: CallbackQuery, state: FSMContext) -> None:
+    language = get_language(query.from_user.id) or "ru"
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer(TEXT[language]["edit_cancelled"])
+
+
+@dp.callback_query(SavedOperationFlow.viewing, lambda query: query.data and query.data.startswith("saved:delete:"))
+async def ask_saved_transaction_delete(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    view_data = await state.get_data()
+    if view_data.get("transaction_id") != transaction_id:
+        await query.answer()
+        return
+    transaction = get_transaction(query.from_user.id, transaction_id)
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if not transaction or not query.message:
+        if query.message:
+            await query.message.answer(TEXT[language]["transaction_not_found"])
+        return
+    await state.set_state(SavedOperationFlow.delete_confirmation)
+    await state.update_data(transaction_id=transaction_id, original=transaction)
+    details = saved_transaction_text(transaction, language)
+    await query.message.answer(
+        TEXT[language]["delete_review"].format(details=details),
+        reply_markup=delete_confirmation_keyboard(language),
+    )
+
+
+@dp.callback_query(SavedOperationFlow.delete_confirmation, lambda query: query.data == "saved:delete-confirm")
+async def confirm_saved_transaction_delete(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    transaction_id = data.get("transaction_id")
+    original = data.get("original")
+    language = get_language(query.from_user.id) or "ru"
+    current = get_transaction(query.from_user.id, transaction_id) if transaction_id else None
+    await query.answer()
+    if not query.message:
+        return
+    if not original or current != original:
+        await state.clear()
+        await query.message.answer(TEXT[language]["stale_edit"])
+        return
+    succeeded = delete_transaction(query.from_user.id, transaction_id)
+    await state.clear()
+    await query.message.answer(TEXT[language]["delete_saved"] if succeeded else TEXT[language]["transaction_not_found"])
+
+
+@dp.callback_query(SavedOperationFlow.delete_confirmation, lambda query: query.data == "saved:delete-cancel")
+async def cancel_saved_transaction_delete(query: CallbackQuery, state: FSMContext) -> None:
+    language = get_language(query.from_user.id) or "ru"
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer(TEXT[language]["edit_cancelled"])
 
 
 @dp.message(TransactionFlow.rate)
