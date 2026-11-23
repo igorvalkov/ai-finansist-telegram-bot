@@ -142,6 +142,101 @@ def get_balance_totals(telegram_user_id: int) -> dict[str, str]:
     return {currency: format(balance, "f") for currency, balance in balances.items()}
 
 
+def list_transactions(
+    telegram_user_id: int, limit: int = 10, offset: int = 0
+) -> list[dict[str, Any]]:
+    """List one user's transactions newest first, with bounded pagination."""
+    _validate_identifier(telegram_user_id, "Telegram user ID")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        raise ValueError("Limit must be an integer from 1 to 50")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("Offset must be a non-negative integer")
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT id, telegram_user_id, kind, amount, currency, category, "
+            "description, occurred_at, created_at FROM transactions "
+            "WHERE telegram_user_id = ? "
+            "ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?",
+            (telegram_user_id, limit, offset),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_transaction(telegram_user_id: int, transaction_id: int) -> dict[str, Any] | None:
+    """Get a transaction only when it belongs to the requested Telegram user."""
+    _validate_identifier(telegram_user_id, "Telegram user ID")
+    _validate_identifier(transaction_id, "Transaction ID")
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT id, telegram_user_id, kind, amount, currency, category, "
+            "description, occurred_at, created_at FROM transactions "
+            "WHERE telegram_user_id = ? AND id = ?",
+            (telegram_user_id, transaction_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def update_transaction(
+    telegram_user_id: int,
+    transaction_id: int,
+    *,
+    kind: str,
+    amount: str,
+    currency: str,
+    category: str,
+    description: str,
+    occurred_at: datetime,
+) -> bool:
+    """Update a complete transaction record, scoped to its owner and ID."""
+    _validate_identifier(telegram_user_id, "Telegram user ID")
+    _validate_identifier(transaction_id, "Transaction ID")
+    if kind not in {"income", "expense"}:
+        raise ValueError("Unsupported transaction kind")
+    if currency not in {"UZS", "USD"}:
+        raise ValueError("Unsupported currency")
+    parsed_amount = _parse_positive_decimal(amount, "transaction amount")
+    if not isinstance(category, str) or not category.strip():
+        raise ValueError("Category must not be empty")
+    if not isinstance(description, str):
+        raise ValueError("Description must be text")
+    if not isinstance(occurred_at, datetime):
+        raise ValueError("Transaction date must be a datetime")
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE transactions SET kind = ?, amount = ?, currency = ?, "
+            "category = ?, description = ?, occurred_at = ? "
+            "WHERE telegram_user_id = ? AND id = ?",
+            (
+                kind,
+                format(parsed_amount, "f"),
+                currency,
+                category,
+                description,
+                occurred_at.isoformat(timespec="seconds"),
+                telegram_user_id,
+                transaction_id,
+            ),
+        )
+        return cursor.rowcount == 1
+
+
+def delete_transaction(telegram_user_id: int, transaction_id: int) -> bool:
+    """Delete a transaction only if it belongs to the requesting user."""
+    _validate_identifier(telegram_user_id, "Telegram user ID")
+    _validate_identifier(transaction_id, "Transaction ID")
+    with _connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM transactions WHERE telegram_user_id = ? AND id = ?",
+            (telegram_user_id, transaction_id),
+        )
+        return cursor.rowcount == 1
+
+
+def _validate_identifier(value: int, label: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+
+
 def _parse_positive_decimal(value: str, label: str) -> Decimal:
     """Parse bounded plain decimal text and reject unsafe/malformed values."""
     if not isinstance(value, str) or not value or len(value) > 64:
