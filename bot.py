@@ -10,11 +10,13 @@ from decimal import Decimal, InvalidOperation, localcontext
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
+
+from ai_parser import parse_financial_message
 
 from database import (
     add_transaction,
@@ -35,6 +37,7 @@ from database import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not BOT_TOKEN or BOT_TOKEN == "replace_with_telegram_bot_token":
     raise RuntimeError("Set BOT_TOKEN in your local .env file before starting the bot.")
@@ -97,6 +100,17 @@ TEXT = {
         "confirmation": "Проверьте операцию:\n{kind}: {amount} {currency}\nКатегория: {category}\nОписание: {description}\nДата: {date}",
         "saved": "Операция сохранена.",
         "cancelled": "Ввод операции отменён.",
+        "ai_unconfigured": "Для разбора сообщений не настроен GROQ_API_KEY в локальном .env.",
+        "ai_error": "Не удалось разобрать сообщение сейчас. Попробуйте ещё раз позже.",
+        "ai_unsupported": "Не удалось распознать доход или расход. Опишите операцию обычным текстом.",
+        "ai_clarify": "Уточните операцию и отправьте её одним сообщением. Не удалось определить: {fields}.",
+        "ai_fields": {
+            "kind": "тип операции (доход или расход)", "amount": "сумму",
+            "currency": "валюту (UZS или USD)", "category": "категорию",
+            "date": "дату", "details": "что именно было оплачено или получено",
+            "message": "описание операции",
+        },
+        "ai_too_long": "Сообщение слишком длинное. Отправьте описание операции не длиннее 2000 символов.",
         "stale": "Этот шаг уже завершён. Начните заново через меню.",
         "balance_summary": "Баланс:\nUZS: {uzs}\nUSD: {usd}",
         "balance_total": "Общий эквивалент по заданному курсу: {total} UZS",
@@ -166,6 +180,17 @@ TEXT = {
         "confirmation": "Operatsiyani tekshiring:\n{kind}: {amount} {currency}\nKategoriya: {category}\nIzoh: {description}\nSana: {date}",
         "saved": "Operatsiya saqlandi.",
         "cancelled": "Operatsiya kiritish bekor qilindi.",
+        "ai_unconfigured": "Xabarlarni tahlil qilish uchun lokal .env faylida GROQ_API_KEY sozlanmagan.",
+        "ai_error": "Xabarni hozir tahlil qilib bo‘lmadi. Keyinroq qayta urinib ko‘ring.",
+        "ai_unsupported": "Daromad yoki xarajatni aniqlab bo‘lmadi. Operatsiyani oddiy matnda tasvirlang.",
+        "ai_clarify": "Operatsiyani aniqlashtirib, bitta xabarda qayta yuboring. Aniqlanmagan: {fields}.",
+        "ai_fields": {
+            "kind": "operatsiya turi (daromad yoki xarajat)", "amount": "summa",
+            "currency": "valyuta (UZS yoki USD)", "category": "toifa",
+            "date": "sana", "details": "nima uchun to‘lov qilingan yoki daromad olinganini",
+            "message": "operatsiya tavsifi",
+        },
+        "ai_too_long": "Xabar juda uzun. Operatsiyani 2000 belgidan oshmagan matnda yuboring.",
         "stale": "Bu qadam allaqachon yakunlangan. Menyu orqali qaytadan boshlang.",
         "balance_summary": "Balans:\nUZS: {uzs}\nUSD: {usd}",
         "balance_total": "Belgilangan kurs bo‘yicha jami: {total} UZS",
@@ -941,12 +966,24 @@ async def show_transaction_confirmation(
     data = await state.get_data()
     language = get_language(telegram_user_id) or "ru"
     data["description"] = description.strip()
-    await state.update_data(description=data["description"])
+    occurred_at_value = data.get("occurred_at")
+    if isinstance(occurred_at_value, str):
+        occurred_at = datetime.fromisoformat(occurred_at_value)
+    elif isinstance(occurred_at_value, datetime):
+        occurred_at = occurred_at_value
+    else:
+        occurred_at = datetime.now(ZoneInfo("Asia/Tashkent"))
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=ZoneInfo("Asia/Tashkent"))
+    data["occurred_at"] = occurred_at.isoformat(timespec="seconds")
+    await state.update_data(
+        description=data["description"], occurred_at=data["occurred_at"]
+    )
     await state.set_state(TransactionFlow.confirmation)
     labels = TEXT[language]
     kind_label = labels[data["kind"]]
     category_label = labels["categories"][data["category"]]
-    date_label = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d")
+    date_label = occurred_at.astimezone(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d")
     summary = labels["confirmation"].format(
         kind=kind_label,
         amount=data["amount"],
@@ -984,7 +1021,7 @@ async def confirm_transaction(query: CallbackQuery, state: FSMContext) -> None:
         currency=data["currency"],
         category=data["category"],
         description=data.get("description", ""),
-        occurred_at=datetime.now(ZoneInfo("Asia/Tashkent")),
+        occurred_at=datetime.fromisoformat(data["occurred_at"]),
     )
     language = get_language(query.from_user.id) or "ru"
     await state.clear()
@@ -1016,6 +1053,52 @@ async def help_command(message: Message) -> None:
     language = get_language(message.from_user.id) if message.from_user else None
     language = language or "ru"
     await message.answer(TEXT[language]["help"])
+
+
+@dp.message(StateFilter(None), lambda message: bool(message.text) and not message.text.startswith("/"))
+async def parse_financial_text(message: Message, state: FSMContext) -> None:
+    """Use AI to draft a transaction; persistence still requires user confirmation."""
+    if not message.from_user or not message.text:
+        return
+    language = get_language(message.from_user.id) or "ru"
+    text = message.text.strip()
+    if len(text) > 2000:
+        await message.answer(TEXT[language]["ai_too_long"])
+        return
+    if not GROQ_API_KEY:
+        await message.answer(TEXT[language]["ai_unconfigured"])
+        return
+    try:
+        parsed = await parse_financial_message(text, language, api_key=GROQ_API_KEY)
+    except Exception:
+        # Never include the input, API key, or provider exception in logs/messages.
+        await message.answer(TEXT[language]["ai_error"])
+        return
+
+    if parsed.status == "error":
+        await message.answer(TEXT[language]["ai_error"])
+        return
+    if parsed.status == "unsupported":
+        await message.answer(TEXT[language]["ai_unsupported"])
+        return
+    if parsed.status != "ready":
+        field_labels = TEXT[language]["ai_fields"]
+        fields = ", ".join(field_labels[field] for field in parsed.missing_fields if field in field_labels)
+        await message.answer(
+            TEXT[language]["ai_clarify"].format(fields=fields or TEXT[language]["ai_unsupported"])
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        kind=parsed.kind,
+        amount=parsed.amount,
+        currency=parsed.currency,
+        category=parsed.category,
+        description=parsed.description,
+        occurred_at=parsed.occurred_at.isoformat(timespec="seconds") if parsed.occurred_at else None,
+    )
+    await show_transaction_confirmation(message, state, parsed.description, message.from_user.id)
 
 
 async def main() -> None:
