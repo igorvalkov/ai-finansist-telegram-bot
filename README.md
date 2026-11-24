@@ -23,6 +23,26 @@ Telegram-бот для личного учёта доходов и расход�
 
 Не добавляйте `.env` и реальные токены в GitHub.
 
+## Работа с другого компьютера
+
+Исходный код хранится в [GitHub-репозитории](https://github.com/igorvalkov/ai-finansist-telegram-bot). На новом компьютере установите Git и Python 3.13+, затем выполните в PowerShell:
+
+```powershell
+git clone https://github.com/igorvalkov/ai-finansist-telegram-bot.git
+cd ai-finansist-telegram-bot
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env
+.\.venv\Scripts\python.exe bot.py
+```
+
+В `.env` укажите собственные `BOT_TOKEN` и `GROQ_API_KEY`; `GROQ_TEXT_MODEL` уже заполнен в примере. `DATABASE_PATH` можно оставить пустым — тогда SQLite-база создастся в папке проекта. Файл `.env` создаётся отдельно на каждом компьютере и не публикуется в GitHub.
+
+Чтобы получить последние изменения кода в уже клонированной папке, выполните `git pull`. Для отправки своих изменений используйте `git status`, затем `git add`, `git commit` и `git push`.
+
+Код синхронизируется через GitHub, но локальная SQLite-база с финансовыми записями не синхронизируется и намеренно исключена из репозитория. Если понадобится перенести записи на другой компьютер, перенесите файл базы отдельно защищённым способом.
+
 ## Действия бота
 
 - `/start` — выбор языка и главное меню
