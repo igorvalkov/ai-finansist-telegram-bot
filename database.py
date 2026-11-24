@@ -2,10 +2,11 @@
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 DEFAULT_DB_PATH = Path(__file__).parent / "data" / "finance_bot.sqlite3"
@@ -24,9 +25,20 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _connection() -> Iterator[sqlite3.Connection]:
+    """Run a transaction and always release its SQLite connection."""
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def initialize_database() -> None:
     """Create the initial schema if this is a fresh local database."""
-    with _connect() as connection:
+    with _connection() as connection:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -57,7 +69,7 @@ def initialize_database() -> None:
 
 
 def ensure_user(telegram_user_id: int) -> dict[str, Any]:
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             "INSERT OR IGNORE INTO users (telegram_user_id) VALUES (?)",
             (telegram_user_id,),
@@ -78,7 +90,7 @@ def get_language(telegram_user_id: int) -> str | None:
 def set_language(telegram_user_id: int, language: str) -> None:
     if language not in {"ru", "uz"}:
         raise ValueError("Unsupported language")
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             "INSERT INTO users (telegram_user_id, language) VALUES (?, ?) "
             "ON CONFLICT (telegram_user_id) DO UPDATE SET language = excluded.language",
@@ -90,7 +102,7 @@ def set_usd_to_uzs_rate(telegram_user_id: int, rate: str) -> None:
     """Store a positive user-provided rate as text to avoid float rounding."""
     parsed_rate = _parse_positive_decimal(rate, "exchange rate")
     normalized_rate = format(parsed_rate, "f")
-    with _connect() as connection:
+    with _connection() as connection:
         connection.execute(
             "INSERT INTO users (telegram_user_id, usd_to_uzs_rate) VALUES (?, ?) "
             "ON CONFLICT (telegram_user_id) DO UPDATE "
@@ -110,7 +122,7 @@ def get_usd_to_uzs_rate(telegram_user_id: int) -> str | None:
 
 def get_balance_totals(telegram_user_id: int) -> dict[str, str]:
     """Return net balances per currency without using SQLite floating sums."""
-    with _connect() as connection:
+    with _connection() as connection:
         rows = connection.execute(
             "SELECT kind, currency, amount FROM transactions "
             "WHERE telegram_user_id = ?",
@@ -151,7 +163,7 @@ def list_transactions(
         raise ValueError("Limit must be an integer from 1 to 50")
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise ValueError("Offset must be a non-negative integer")
-    with _connect() as connection:
+    with _connection() as connection:
         rows = connection.execute(
             "SELECT id, telegram_user_id, kind, amount, currency, category, "
             "description, occurred_at, created_at FROM transactions "
@@ -195,7 +207,7 @@ def get_transactions_for_period(
         "OR upper(substr(occurred_at, -1, 1)) = 'Z' "
         "THEN date(occurred_at, '+5 hours') ELSE date(occurred_at) END"
     )
-    with _connect() as connection:
+    with _connection() as connection:
         rows = connection.execute(
             "SELECT id, telegram_user_id, kind, amount, currency, category, "
             "description, occurred_at, created_at FROM transactions "
@@ -218,7 +230,7 @@ def get_transaction(telegram_user_id: int, transaction_id: int) -> dict[str, Any
     """Get a transaction only when it belongs to the requested Telegram user."""
     _validate_identifier(telegram_user_id, "Telegram user ID")
     _validate_identifier(transaction_id, "Transaction ID")
-    with _connect() as connection:
+    with _connection() as connection:
         row = connection.execute(
             "SELECT id, telegram_user_id, kind, amount, currency, category, "
             "description, occurred_at, created_at FROM transactions "
@@ -253,7 +265,7 @@ def update_transaction(
         raise ValueError("Description must be text")
     if not isinstance(occurred_at, datetime):
         raise ValueError("Transaction date must be a datetime")
-    with _connect() as connection:
+    with _connection() as connection:
         cursor = connection.execute(
             "UPDATE transactions SET kind = ?, amount = ?, currency = ?, "
             "category = ?, description = ?, occurred_at = ? "
@@ -276,7 +288,7 @@ def delete_transaction(telegram_user_id: int, transaction_id: int) -> bool:
     """Delete a transaction only if it belongs to the requesting user."""
     _validate_identifier(telegram_user_id, "Telegram user ID")
     _validate_identifier(transaction_id, "Transaction ID")
-    with _connect() as connection:
+    with _connection() as connection:
         cursor = connection.execute(
             "DELETE FROM transactions WHERE telegram_user_id = ? AND id = ?",
             (telegram_user_id, transaction_id),
@@ -322,7 +334,7 @@ def add_transaction(
     parsed_amount = _parse_positive_decimal(amount, "transaction amount")
     normalized_amount = format(parsed_amount, "f")
     ensure_user(telegram_user_id)
-    with _connect() as connection:
+    with _connection() as connection:
         cursor = connection.execute(
             "INSERT INTO transactions "
             "(telegram_user_id, kind, amount, currency, category, description, occurred_at) "
