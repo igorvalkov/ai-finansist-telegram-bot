@@ -1,11 +1,13 @@
+Warning: truncated output (original token count: 13466)
+Total output lines: 1183
+
 """Entry point for the AI Finance Assistant Telegram bot."""
 
 import asyncio
 import logging
 import os
 import re
-from datetime import datetime
-from datetime import date as date_type
+from datetime import date as date_type, datetime, timedelta
 from decimal import Decimal, InvalidOperation, localcontext
 from zoneinfo import ZoneInfo
 
@@ -13,7 +15,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 from ai_parser import parse_financial_message
@@ -24,6 +26,7 @@ from database import (
     get_balance_totals,
     get_language,
     get_usd_to_uzs_rate,
+    get_transactions_for_period,
     delete_transaction,
     get_transaction,
     initialize_database,
@@ -32,6 +35,7 @@ from database import (
     set_usd_to_uzs_rate,
     update_transaction,
 )
+from report_excel import build_financial_report
 
 
 load_dotenv()
@@ -120,6 +124,12 @@ TEXT = {
         "rate_invalid": "Введите положительный курс числом, например 12900 или 12900,50.",
         "rate_saved": "Курс сохранён: 1 USD = {rate} UZS.",
         "rate_cancelled": "Изменение курса отменено.",
+        "report_choose": "Выберите период отчёта:",
+        "report_week": "Эта неделя",
+        "report_month": "Этот месяц",
+        "report_empty": "За выбранный период операций нет.",
+        "report_error": "Не удалось сформировать отчёт. За период слишком много операций или возникла ошибка.",
+        "report_private_only": "Финансовый отчёт можно скачать только в личном чате с ботом.",
         "transactions_empty": "Пока нет сохранённых операций.",
         "transactions_title": "Ваши операции (страница {page}):",
         "transaction_details": "Операция №{id}\n{kind}: {amount} {currency}\nКатегория: {category}\nОписание: {description}\nДата: {date}",
@@ -200,6 +210,12 @@ TEXT = {
         "rate_invalid": "Musbat kursni kiriting, masalan 12900 yoki 12900,50.",
         "rate_saved": "Kurs saqlandi: 1 USD = {rate} UZS.",
         "rate_cancelled": "Kursni o‘zgartirish bekor qilindi.",
+        "report_choose": "Hisobot davrini tanlang:",
+        "report_week": "Bu hafta",
+        "report_month": "Bu oy",
+        "report_empty": "Tanlangan davrda operatsiyalar yo‘q.",
+        "report_error": "Hisobotni yaratib bo‘lmadi. Davrda juda ko‘p operatsiya yoki xatolik yuz berdi.",
+        "report_private_only": "Moliyaviy hisobotni faqat bot bilan shaxsiy chatda yuklab olish mumkin.",
         "transactions_empty": "Hozircha saqlangan operatsiyalar yo‘q.",
         "transactions_title": "Operatsiyalaringiz ({page}-sahifa):",
         "transaction_details": "Operatsiya №{id}\n{kind}: {amount} {currency}\nToifa: {category}\nIzoh: {description}\nSana: {date}",
@@ -449,93 +465,7 @@ async def menu_action(query: CallbackQuery, state: FSMContext) -> None:
     if query.message:
         if query.data == "menu:operation":
             await state.set_state(TransactionFlow.kind)
-            await query.message.answer(TEXT[language]["choose_kind"], reply_markup=kind_keyboard(language))
-            return
-        if query.data == "menu:balance":
-            totals = get_balance_totals(query.from_user.id)
-            balance_message = TEXT[language]["balance_summary"].format(
-                uzs=format_decimal(Decimal(totals["UZS"]), language),
-                usd=format_decimal(Decimal(totals["USD"]), language),
-            )
-            rate = get_usd_to_uzs_rate(query.from_user.id)
-            if rate is not None:
-                with localcontext() as context:
-                    context.prec = 50
-                    total_uzs = Decimal(totals["UZS"]) + Decimal(totals["USD"]) * Decimal(rate)
-                balance_message += "\n" + TEXT[language]["balance_total"].format(
-                    total=format_decimal(total_uzs, language)
-                )
-            else:
-                balance_message += "\n" + TEXT[language]["balance_rate_missing"]
-            await query.message.answer(balance_message)
-            return
-        if query.data == "menu:transactions":
-            await show_saved_transactions(query.message, query.from_user.id, language)
-            return
-        if query.data == "menu:rate":
-            current_rate = get_usd_to_uzs_rate(query.from_user.id)
-            await state.set_state(TransactionFlow.rate)
-            prompt = (
-                TEXT[language]["rate_prompt"]
-                if current_rate is None
-                else TEXT[language]["rate_current"].format(
-                    rate=format_decimal(Decimal(current_rate), language)
-                )
-            )
-            await query.message.answer(prompt, reply_markup=rate_keyboard(language))
-            return
-        await query.message.answer(TEXT[language]["soon"])
-
-
-@dp.callback_query(lambda query: query.data and query.data.startswith("saved:list:"))
-async def saved_transactions_page(query: CallbackQuery, state: FSMContext) -> None:
-    try:
-        offset = int(query.data.rsplit(":", maxsplit=1)[1])
-    except (ValueError, AttributeError):
-        await query.answer()
-        return
-    if offset < 0 or offset > 100000 or offset % 10:
-        await query.answer()
-        return
-    await state.clear()
-    language = get_language(query.from_user.id) or "ru"
-    await query.answer()
-    if query.message:
-        await show_saved_transactions(query.message, query.from_user.id, language, offset)
-
-
-@dp.callback_query(lambda query: query.data and query.data.startswith("saved:open:"))
-async def open_saved_transaction(query: CallbackQuery, state: FSMContext) -> None:
-    try:
-        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
-    except (ValueError, AttributeError):
-        await query.answer()
-        return
-    transaction = get_transaction(query.from_user.id, transaction_id)
-    await state.clear()
-    language = get_language(query.from_user.id) or "ru"
-    await query.answer()
-    if not query.message:
-        return
-    if transaction is None:
-        await query.message.answer(TEXT[language]["transaction_not_found"])
-        return
-    await state.update_data(transaction_id=transaction_id)
-    await state.set_state(SavedOperationFlow.viewing)
-    await query.message.answer(
-        saved_transaction_text(transaction, language),
-        reply_markup=transaction_detail_keyboard(transaction_id, language),
-    )
-
-
-@dp.callback_query(SavedOperationFlow.viewing, lambda query: query.data and query.data.startswith("saved:edit:"))
-async def begin_saved_transaction_edit(query: CallbackQuery, state: FSMContext) -> None:
-    try:
-        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
-    except (ValueError, AttributeError):
-        await query.answer()
-        return
-    view_data = await state.get_data()
+            await query.message.answer(TEXT[language]…1466 tokens truncated…ta = await state.get_data()
     if view_data.get("transaction_id") != transaction_id:
         await query.answer()
         return
@@ -1055,13 +985,10 @@ async def help_command(message: Message) -> None:
     await message.answer(TEXT[language]["help"])
 
 
-@dp.message(StateFilter(None), lambda message: bool(message.text) and not message.text.startswith("/"))
-async def parse_financial_text(message: Message, state: FSMContext) -> None:
-    """Use AI to draft a transaction; persistence still requires user confirmation."""
-    if not message.from_user or not message.text:
-        return
-    language = get_language(message.from_user.id) or "ru"
-    text = message.text.strip()
+async def process_financial_text(
+    message: Message, state: FSMContext, text: str, language: str
+) -> None:
+    """Parse text into a draft; persistence still requires user confirmation."""
     if len(text) > 2000:
         await message.answer(TEXT[language]["ai_too_long"])
         return
@@ -1099,6 +1026,14 @@ async def parse_financial_text(message: Message, state: FSMContext) -> None:
         occurred_at=parsed.occurred_at.isoformat(timespec="seconds") if parsed.occurred_at else None,
     )
     await show_transaction_confirmation(message, state, parsed.description, message.from_user.id)
+
+
+@dp.message(StateFilter(None), lambda message: bool(message.text) and not message.text.startswith("/"))
+async def parse_financial_text(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not message.text:
+        return
+    language = get_language(message.from_user.id) or "ru"
+    await process_financial_text(message, state, message.text.strip(), language)
 
 
 async def main() -> None:
