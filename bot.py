@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 13466)
-Total output lines: 1183
-
 """Entry point for the AI Finance Assistant Telegram bot."""
 
 import asyncio
@@ -465,7 +462,145 @@ async def menu_action(query: CallbackQuery, state: FSMContext) -> None:
     if query.message:
         if query.data == "menu:operation":
             await state.set_state(TransactionFlow.kind)
-            await query.message.answer(TEXT[language]…1466 tokens truncated…ta = await state.get_data()
+            await query.message.answer(TEXT[language]["choose_kind"], reply_markup=kind_keyboard(language))
+            return
+        if query.data == "menu:balance":
+            totals = get_balance_totals(query.from_user.id)
+            balance_message = TEXT[language]["balance_summary"].format(
+                uzs=format_decimal(Decimal(totals["UZS"]), language),
+                usd=format_decimal(Decimal(totals["USD"]), language),
+            )
+            rate = get_usd_to_uzs_rate(query.from_user.id)
+            if rate is not None:
+                with localcontext() as context:
+                    context.prec = 50
+                    total_uzs = Decimal(totals["UZS"]) + Decimal(totals["USD"]) * Decimal(rate)
+                balance_message += "\n" + TEXT[language]["balance_total"].format(
+                    total=format_decimal(total_uzs, language)
+                )
+            else:
+                balance_message += "\n" + TEXT[language]["balance_rate_missing"]
+            await query.message.answer(balance_message)
+            return
+        if query.data == "menu:report":
+            report_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=TEXT[language]["report_week"], callback_data="report:week"),
+                InlineKeyboardButton(text=TEXT[language]["report_month"], callback_data="report:month"),
+            ]])
+            await query.message.answer(TEXT[language]["report_choose"], reply_markup=report_keyboard)
+            return
+        if query.data == "menu:transactions":
+            await show_saved_transactions(query.message, query.from_user.id, language)
+            return
+        if query.data == "menu:rate":
+            current_rate = get_usd_to_uzs_rate(query.from_user.id)
+            await state.set_state(TransactionFlow.rate)
+            prompt = (
+                TEXT[language]["rate_prompt"]
+                if current_rate is None
+                else TEXT[language]["rate_current"].format(
+                    rate=format_decimal(Decimal(current_rate), language)
+                )
+            )
+            await query.message.answer(prompt, reply_markup=rate_keyboard(language))
+            return
+        await query.message.answer(TEXT[language]["soon"])
+
+
+@dp.callback_query(lambda query: query.data in {"report:week", "report:month"})
+async def export_financial_report(query: CallbackQuery) -> None:
+    if not query.message:
+        await query.answer()
+        return
+    language = get_language(query.from_user.id) or "ru"
+    if query.message.chat.type != "private":
+        await query.answer(TEXT[language]["report_private_only"], show_alert=True)
+        return
+    today = datetime.now(ZoneInfo("Asia/Tashkent")).date()
+    if query.data == "report:week":
+        start_date = today - timedelta(days=today.weekday())
+        end_date = start_date + timedelta(days=7)
+        period = "week"
+    else:
+        start_date = date_type(today.year, today.month, 1)
+        end_date = (
+            date_type(today.year + 1, 1, 1)
+            if today.month == 12
+            else date_type(today.year, today.month + 1, 1)
+        )
+        period = "month"
+
+    await query.answer()
+    try:
+        transactions = get_transactions_for_period(query.from_user.id, start_date, end_date)
+        if not transactions:
+            await query.message.answer(TEXT[language]["report_empty"])
+            return
+        report_file, filename = await asyncio.to_thread(
+            build_financial_report,
+            transactions,
+            period,
+            start_date,
+            end_date,
+            language,
+        )
+        await query.message.answer_document(
+            BufferedInputFile(report_file.getvalue(), filename=filename)
+        )
+    except Exception:
+        # Never include private transaction fields or internal errors in messages/logs.
+        await query.message.answer(TEXT[language]["report_error"])
+
+
+@dp.callback_query(lambda query: query.data and query.data.startswith("saved:list:"))
+async def saved_transactions_page(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        offset = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    if offset < 0 or offset > 100000 or offset % 10:
+        await query.answer()
+        return
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if query.message:
+        await show_saved_transactions(query.message, query.from_user.id, language, offset)
+
+
+@dp.callback_query(lambda query: query.data and query.data.startswith("saved:open:"))
+async def open_saved_transaction(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    transaction = get_transaction(query.from_user.id, transaction_id)
+    await state.clear()
+    language = get_language(query.from_user.id) or "ru"
+    await query.answer()
+    if not query.message:
+        return
+    if transaction is None:
+        await query.message.answer(TEXT[language]["transaction_not_found"])
+        return
+    await state.update_data(transaction_id=transaction_id)
+    await state.set_state(SavedOperationFlow.viewing)
+    await query.message.answer(
+        saved_transaction_text(transaction, language),
+        reply_markup=transaction_detail_keyboard(transaction_id, language),
+    )
+
+
+@dp.callback_query(SavedOperationFlow.viewing, lambda query: query.data and query.data.startswith("saved:edit:"))
+async def begin_saved_transaction_edit(query: CallbackQuery, state: FSMContext) -> None:
+    try:
+        transaction_id = int(query.data.rsplit(":", maxsplit=1)[1])
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    view_data = await state.get_data()
     if view_data.get("transaction_id") != transaction_id:
         await query.answer()
         return
