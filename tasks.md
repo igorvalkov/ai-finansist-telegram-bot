@@ -22,7 +22,7 @@
 
 - [x] Установить Python 3.13.17, создать `.venv`, установить зависимости и tzdata для Windows; `pip check` прошёл.
 - [x] Проверить синтаксис через `python -m compileall -q bot.py database.py ai_parser.py report_excel.py tests`.
-- [ ] Запустить `quick_validate.py` для `finance-bot-tester` и `security-review`; Python в этой среде недоступен.
+- [x] Проверить валидатор навыков: `quick_validate.py` в репозитории отсутствует; выполнена ручная проверка структуры и инструкций обоих навыков.
 - [x] Вручную проверить frontmatter, имена и каталоги обоих навыков, ссылки из `AGENTS.md` и отсутствие scaffold placeholders.
 - [x] Вручную проверить frontmatter, совпадение имени навыка с каталогом, ссылку из `AGENTS.md` и отсутствие scaffold placeholders.
 - [ ] Проверить Telegram-сценарии с тестовым ботом.
