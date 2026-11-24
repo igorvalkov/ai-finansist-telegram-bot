@@ -2,7 +2,7 @@
 
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
@@ -159,6 +159,58 @@ def list_transactions(
             "ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?",
             (telegram_user_id, limit, offset),
         ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_transactions_for_period(
+    telegram_user_id: int,
+    start_date: date,
+    end_date: date,
+    *,
+    limit: int = 10_000,
+) -> list[dict[str, Any]]:
+    """Return a user's records for the Tashkent calendar interval [start, end).
+
+    ISO timestamps with explicit offsets are converted to Tashkent's UTC+5 date.
+    Legacy/naive timestamps are treated as Tashkent local time. The cap prevents
+    large exports from consuming unbounded memory; overflow raises ValueError
+    rather than returning an incomplete report.
+    """
+    _validate_identifier(telegram_user_id, "Telegram user ID")
+    if (
+        isinstance(start_date, datetime)
+        or not isinstance(start_date, date)
+        or isinstance(end_date, datetime)
+        or not isinstance(end_date, date)
+        or end_date <= start_date
+    ):
+        raise ValueError("Period must contain valid start and exclusive end dates")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+        raise ValueError("Limit must be an integer from 1 to 10000")
+
+    # SQLite normalizes ISO timestamps with offsets to UTC before applying +5h.
+    # Naive timestamps are already local Asia/Tashkent times and stay unchanged.
+    tashkent_date = (
+        "CASE WHEN substr(occurred_at, -6, 1) IN ('+', '-') "
+        "OR upper(substr(occurred_at, -1, 1)) = 'Z' "
+        "THEN date(occurred_at, '+5 hours') ELSE date(occurred_at) END"
+    )
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT id, telegram_user_id, kind, amount, currency, category, "
+            "description, occurred_at, created_at FROM transactions "
+            f"WHERE telegram_user_id = ? AND {tashkent_date} >= ? "
+            f"AND {tashkent_date} < ? "
+            "ORDER BY occurred_at ASC, id ASC LIMIT ?",
+            (
+                telegram_user_id,
+                start_date.isoformat(),
+                end_date.isoformat(),
+                limit + 1,
+            ),
+        ).fetchall()
+    if len(rows) > limit:
+        raise ValueError("Period has too many transactions to export")
     return [dict(row) for row in rows]
 
 
